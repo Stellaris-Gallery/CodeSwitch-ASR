@@ -1,0 +1,29 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data -- NEVER commit audio or participant information
+data/
+recordings/
+consent/
+*.wav
+*.flac
+*.mp3
+*.m4a
+
+# Training outputs
+checkpoints/
+*.pt
+*.ckpt
+*.safetensors
+wandb/
+outputs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/

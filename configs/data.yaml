@@ -1,0 +1,14 @@
+# Datasets. Values are starting points -- decide as a team.
+seed: 0
+sample_rate: 16000
+
+ascend:
+  hf_name: CAiRE/ASCEND          # public, CC BY-SA 4.0; splits: train / validation / test
+
+ours:
+  root: recordings/              # private, git-ignored
+  mics: [lav, dr70d, esp32]      # close-talk / far-field recorder / low-cost board
+  conversations: 3               # 5-10 min each
+  # Split by WHOLE conversation to avoid leakage. TODO: decide which ones.
+  train_conversations: []
+  test_conversations: []
