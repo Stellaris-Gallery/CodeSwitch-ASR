@@ -13,6 +13,8 @@ consent/
 *.flac
 *.mp3
 *.m4a
+*.mp4
+*.mov
 
 # Training outputs
 checkpoints/

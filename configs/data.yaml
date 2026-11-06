@@ -2,13 +2,24 @@
 seed: 0
 sample_rate: 16000
 
-ascend:
+public:
+  name: ascend                   # TBD -- ASCEND is the current candidate
   hf_name: CAiRE/ASCEND          # public, CC BY-SA 4.0; splits: train / validation / test
 
 ours:
   root: recordings/              # private, git-ignored
-  mics: [lav, dr70d, esp32]      # close-talk / far-field recorder / low-cost board
+  mic: esp32                     # one low-cost board
   conversations: 3               # 5-10 min each
   # Split by WHOLE conversation to avoid leakage. TODO: decide which ones.
   train_conversations: []
   test_conversations: []
+
+vocab:
+  path: data/vocab.json          # Chinese characters + English letters + "|" + blank
+  word_delimiter: "|"
+  blank: "<blank>"
+
+augment:                         # used by the *_noise configs, training data only
+  room_tone: recordings/room_tone/   # 1 min per session, ESP32
+  snr_db: [10]                   # TODO: decide; noise curve later: [20, 10, 0]
+  reverb: true                   # simulated with pyroomacoustics

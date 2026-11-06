@@ -1,9 +1,9 @@
 """Evaluation.
 
-Mixed error rate (MER): Chinese is scored per character, English per word,
-after text normalization (punctuation, case, full/half-width, spacing).
-Reports overall MER and MER broken down by microphone (lav / dr70d / esp32),
-by dataset (ASCEND vs ours), and by language of the error.
+Greedy CTC decoding: take the most likely token per frame, merge repeats, drop blanks.
+
+Mixed error rate (MER): Chinese is scored per character, English per word, after the
+same text normalization as data.py. Reports MER per test set (public test, ours).
 """
 
 # TODO: implement

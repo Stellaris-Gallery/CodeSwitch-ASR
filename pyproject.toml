@@ -1,17 +1,17 @@
 [project]
 name = "codeswitch-asr"
 version = "0.1.0"
-description = "Fine-tuning speech recognition for Mandarin-English code-switched conversation, across close-talk, far-field, and low-cost microphones (COMP 395 final project)"
+description = "CTC fine-tuning of a pretrained speech encoder for Mandarin-English code-switched conversation on a low-cost microphone (COMP 395 final project)"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "torch>=2.6",
     "transformers",
     "datasets",
-    "peft",
     "accelerate",
     "soundfile",
     "librosa",
+    "pyroomacoustics",
     "jiwer",
     "pyyaml",
     "wandb",

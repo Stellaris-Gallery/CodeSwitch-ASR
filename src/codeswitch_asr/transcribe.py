@@ -1,8 +1,8 @@
-"""Run off-the-shelf ASR models (zero-shot baselines) on a dataset split.
+"""Off-the-shelf ASR model (no fine-tuning).
 
-Candidate models (decide as a team): Whisper (several sizes), plus other
-multilingual / Chinese-English models. Also used to draft transcripts that
-humans then correct.
+Two uses:
+1. Zero-shot reference: run it on the test sets and report MER.
+2. Draft transcripts of our recordings, which we then correct by hand.
 """
 
 # TODO: implement
