@@ -1,14 +1,14 @@
-# Fine-tuning condition: ft_ascend
+# Fine-tuning condition A: public corpus (clean)
 run_name: ft_ascend
 data_config: configs/data.yaml
-base_model: TODO        # pretrained checkpoint to fine-tune
-method: lora            # lora | full
-train_sets: [ascend_train]
-eval_sets: [ascend_test, ours_test]
+base_model: TODO        # pretrained speech encoder (wav2vec 2.0 family) -- not trained on our public corpus
+head: ctc               # new linear CTC output layer over our vocabulary
+train_sets: [public_train]
+eval_sets: [public_test, ours_test]
 optimizer:
   name: adamw
-  lr: 1.0e-4
-epochs: 5
+  lr: 1.0e-4            # TODO: tune
+epochs: 5               # TODO: tune
 batch_size: 8
 seed: 0
 wandb:

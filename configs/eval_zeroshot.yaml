@@ -1,7 +1,8 @@
-# Zero-shot baselines: off-the-shelf models, no fine-tuning.
+# Zero-shot reference: an off-the-shelf ASR model, no fine-tuning.
+# (Our CTC head starts untrained, so it cannot be evaluated zero-shot.)
 run_name: eval_zeroshot
 data_config: configs/data.yaml
-models: []            # TODO: e.g. Whisper sizes and other candidates
-eval_sets: [ascend_test, ours_test]
+models: []            # TODO: e.g. a Whisper size that handles Mandarin + English
+eval_sets: [public_test, ours_test]
 wandb:
   project: codeswitch-asr

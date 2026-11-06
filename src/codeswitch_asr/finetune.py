@@ -1,11 +1,12 @@
-"""Fine-tuning entry point.
+"""CTC fine-tuning entry point.
 
 Usage:
     uv run python -m codeswitch_asr.finetune --config configs/ft_ascend.yaml
 
-Fine-tunes a pretrained ASR model (full or LoRA via peft) on the datasets
-listed in the config. Logs loss curves, per-epoch MER, and the full config
-to Weights & Biases.
+Loads a pretrained speech encoder (wav2vec 2.0 family) with a new linear CTC output
+layer sized to our vocabulary (Hugging Face Wav2Vec2ForCTC; the CTC loss is the
+existing implementation), fine-tunes it on the datasets listed in the config, and
+logs loss curves, per-epoch MER, and the full config to Weights & Biases.
 """
 
 # TODO: implement
