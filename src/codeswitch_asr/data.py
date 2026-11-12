@@ -7,8 +7,9 @@ Every utterance becomes a record like:
     {"audio": array (16 kHz), "text": str, "conversation_id": str, "speaker_id": str}
 
 Also here:
-- Text normalization (punctuation, case, full/half-width, spacing). Used for BOTH the
-  CTC vocabulary and MER, so it must run before either.
+- Text normalization lives in normalize.py (shared with MER). Use it for BOTH the
+  CTC vocabulary and MER. Drop TRAINING utterances where
+  normalize.has_unintelligible(text) is True (transcript has "**").
 - CTC vocabulary: Chinese characters + English letters + word delimiter "|" + blank.
 
 Train/test splits of our recordings are by WHOLE conversation, never by utterance.

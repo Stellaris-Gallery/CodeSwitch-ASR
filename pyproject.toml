@@ -17,6 +17,7 @@ dependencies = [
     "wandb",
     "matplotlib",
     "tqdm",
+    "opencc-python-reimplemented>=0.1.7",
 ]
 
 [dependency-groups]
