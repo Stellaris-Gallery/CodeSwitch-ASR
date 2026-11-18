@@ -1,0 +1,16 @@
+# Fine-tuning condition A: CS-Dialogue clean train only.
+run_name: ft_cs_dialogue
+data_config: configs/data.yaml
+base_model: facebook/wav2vec2-xls-r-300m
+head: ctc
+train_sets: [public_train]
+eval_sets: [public_dev]             # Model selection; never tune on test
+final_eval_sets: [public_test, ours_test]
+optimizer:
+  name: adamw
+  lr: 1.0e-4                       # Starting point; tune on dev
+batch_size: 8                     # Starting point; may need adjustment
+epochs: 5                         # Starting point; tune on dev
+seed: 0
+wandb:
+  project: codeswitch-asr

@@ -1,25 +1,40 @@
-# Datasets. Values are starting points -- decide as a team.
+# CS-Dialogue dataset configuration for CodeSwitch-ASR.
+# Paths below are relative to CS_DIALOGUE_ROOT (the local dataset directory).
+# The training data loader is not implemented yet; these fields define its contract.
 seed: 0
 sample_rate: 16000
 
 public:
-  name: ascend                   # TBD -- ASCEND is the current candidate
-  hf_name: CAiRE/ASCEND          # public, CC BY-SA 4.0; splits: train / validation / test
+  name: cs_dialogue
+  hf_name: BAAI/CS-Dialogue
+  root_env: CS_DIALOGUE_ROOT
+  audio_root: audio/short_wav
+  train_index: data/index/short_wav/train
+  dev_index: data/index/short_wav/dev
+  test_index: data/index/short_wav/test
+  train_manifest: processed/train_ctc_manifest.csv
+  test_manifest: exports/test_full_6257.csv
+  official_train_count: 26239
+  retained_train_count: 25568
+  official_dev_count: 6186
+  official_test_count: 6257
 
 ours:
-  root: recordings/              # private, git-ignored
-  mic: esp32                     # one low-cost board
-  conversations: 3               # 5-10 min each
-  # Split by WHOLE conversation to avoid leakage. TODO: decide which ones.
+  root: recordings/               # Private, git-ignored
+  mic: esp32
+  conversations: 3                # Planned; not yet collected
   train_conversations: []
   test_conversations: []
 
 vocab:
-  path: data/vocab.json          # Chinese characters + English letters + "|" + blank
+  path: processed/vocab.json      # Relative to CS_DIALOGUE_ROOT
   word_delimiter: "|"
+  unk_token: "[UNK]"
   blank: "<blank>"
+  pad_token: "<blank>"           # Must be the same ID as CTC blank
+  size: 2951                     # Generated from retained train only
 
-augment:                         # used by the *_noise configs, training data only
-  room_tone: recordings/room_tone/   # 1 min per session, ESP32
-  snr_db: [10]                   # TODO: decide; noise curve later: [20, 10, 0]
-  reverb: true                   # simulated with pyroomacoustics
+augment:
+  room_tone: recordings/room_tone/
+  snr_db: [10]
+  reverb: true                    # Simulated with pyroomacoustics
