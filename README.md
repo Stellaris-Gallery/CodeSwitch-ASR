@@ -72,7 +72,7 @@ PyTorch (an NVIDIA driver is required); on macOS it installs the default build (
 ```bash
 uv sync                                                          # 1. build the environment
 uv run python scripts/prepare_data.py --config configs/data.yaml # 2. download / prepare data
-uv run python -m codeswitch_asr.finetune --config configs/ft_cs_dialogue.yaml  # 3. fine-tune
+uv run python -m codeswitch_asr.finetune train --config configs/ft_cs_dialogue.yaml  # 3. fine-tune
 ```
 
 TODO: zero-shot and evaluation commands.
@@ -85,9 +85,9 @@ same pretrained encoder.
 | Experiment | Training data | Config |
 |---|---|---|
 | Zero-shot reference | none (off-the-shelf ASR model) | `configs/eval_zeroshot.yaml` |
-| A | public corpus (clean) | `configs/ft_ascend.yaml` |
-| A-noise | public corpus + noise augmentation | `configs/ft_ascend_noise.yaml` |
-| B | A-noise data + our 2 training conversations | `configs/ft_ascend_noise_ours.yaml` |
+| A | CS-Dialogue public train (clean) | `configs/ft_cs_dialogue.yaml` (implemented) |
+| A-noise | public train + noise augmentation | `configs/ft_cs_dialogue_noise.yaml` (configuration only; augmentation not implemented) |
+| B | A-noise + private training conversations | `configs/ft_cs_dialogue_noise_ours.yaml` (configuration only; private data not implemented) |
 
 Test sets: the public test split and our held-out conversation (ESP32).
 Metric: MER (character-level for Mandarin, word-level for English).

@@ -48,7 +48,18 @@ def load_yaml_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("Only head: ctc is supported")
     if not config["train_sets"]:
         raise ValueError("train_sets must not be empty")
+    validate_train_sets(config["train_sets"])
     return config
+
+
+def validate_train_sets(train_sets: list[str]) -> None:
+    """Reject experiment conditions that this PR does not implement."""
+    unsupported = set(train_sets) - {"public_train"}
+    if unsupported or train_sets != ["public_train"]:
+        raise ValueError(
+            "This pipeline supports only train_sets: [public_train]; "
+            f"got {train_sets}. Public noise/private-data conditions are not implemented."
+        )
 
 
 def set_seed(seed: int) -> None:
@@ -223,12 +234,30 @@ def apply_duration_limit(
     return kept, excluded
 
 
+def run_optimizer_step(
+    model,
+    optimizer,
+    scaler,
+    scheduler,
+    max_grad_norm: float,
+) -> int:
+    """Run one clipped optimizer/scheduler step and return the step count."""
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+    return 1
+
+
 def train(
     config: dict[str, Any],
     *,
     dataset_root: str | Path | None = None,
     max_train_samples: int | None = None,
     max_steps: int | None = None,
+    dev_subset_samples: int | None = None,
     dry_run: bool = False,
     device_selection: str = "auto",
 ) -> dict[str, Any]:
@@ -267,6 +296,10 @@ def train(
         raise ValueError("No training samples remain after limits")
     if max_steps is not None and max_steps <= 0:
         raise ValueError("max_steps must be positive")
+    if dev_subset_samples is not None:
+        if dev_subset_samples <= 0:
+            raise ValueError("dev_subset_samples must be positive")
+        dev_subset_samples = min(dev_subset_samples, len(dev_records))
     output_dir = _safe_output_dir(config.get("output_dir", f"checkpoints/{config['run_name']}"))
     if excluded_records:
         exclusion_report = {
@@ -284,6 +317,7 @@ def train(
             "device": str(device),
             "train_samples": len(train_records),
             "dev_samples": len(dev_records),
+            "dev_subset_samples": dev_subset_samples,
             "excluded_train_duration": len(excluded_records),
             "max_train_samples": max_train_samples,
             "max_steps": max_steps,
@@ -326,6 +360,52 @@ def train(
         collate_fn=eval_collate,
         pin_memory=device.type == "cuda",
     )
+
+    train_subset_dataloader = None
+    if max_train_samples is not None:
+        train_subset_dataset = CSDialogueCTCDataset(train_records, processor)
+
+        def train_subset_collate(features):
+            batch = collator(features)
+            batch["_texts"] = [item["text"] for item in features]
+            batch["_tags"] = [
+                next(row.tag for row in train_subset_dataset.records if row.id == item["id"])
+                for item in features
+            ]
+            return batch
+
+        train_subset_dataloader = DataLoader(
+            train_subset_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=workers,
+            collate_fn=train_subset_collate,
+            pin_memory=device.type == "cuda",
+        )
+
+    dev_subset_dataloader = None
+    if dev_subset_samples is not None:
+        dev_subset_dataset = CSDialogueCTCDataset(
+            dev_records[:dev_subset_samples], processor, allow_oov=True
+        )
+
+        def dev_subset_collate(features):
+            batch = collator(features)
+            batch["_texts"] = [item["text"] for item in features]
+            batch["_tags"] = [
+                next(row.tag for row in dev_subset_dataset.records if row.id == item["id"])
+                for item in features
+            ]
+            return batch
+
+        dev_subset_dataloader = DataLoader(
+            dev_subset_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=workers,
+            collate_fn=dev_subset_collate,
+            pin_memory=device.type == "cuda",
+        )
 
     resume_path = config.get("resume_from_checkpoint")
     if resume_path:
@@ -423,6 +503,7 @@ def train(
     if unfreeze_epoch is not None:
         unfreeze_epoch = int(unfreeze_epoch)
 
+    overfit_history: list[dict[str, Any]] = []
     stop_training = False
     for epoch in range(start_epoch, scheduled_epochs):
         if stop_training:
@@ -463,12 +544,9 @@ def train(
             epoch_micro_batches += 1
 
             if (step + 1) % accumulation == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
+                run_optimizer_step(
+                    model, optimizer, scaler, scheduler, max_grad_norm
+                )
                 global_step += 1
                 optimizer_steps_this_epoch += 1
                 if wandb is not None:
@@ -482,12 +560,9 @@ def train(
 
         # Perform an optimizer step for a partial final accumulation block.
         if not stop_training and running_micro_batches > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
+            run_optimizer_step(
+                model, optimizer, scaler, scheduler, max_grad_norm
+            )
             global_step += 1
             optimizer_steps_this_epoch += 1
             if wandb is not None:
@@ -501,14 +576,51 @@ def train(
             model, dev_dataloader, processor, device,
             mixed_precision=mixed_precision,
         )
+        train_subset_result = None
+        if train_subset_dataloader is not None:
+            train_subset_result = evaluate(
+                model, train_subset_dataloader, processor, device,
+                mixed_precision=mixed_precision,
+            )
+        dev_subset_result = None
+        if dev_subset_dataloader is not None:
+            dev_subset_result = evaluate(
+                model, dev_subset_dataloader, processor, device,
+                mixed_precision=mixed_precision,
+            )
         train_epoch_loss = epoch_loss_sum / max(epoch_micro_batches, 1)
         print(
             f"epoch={epoch + 1} train_loss={train_epoch_loss:.6f} "
             f"dev_loss={dev_result['loss']:.6f} "
             f"dev_mer={dev_result['mer']:.6f}"
         )
+        history_row: dict[str, Any] = {
+            "epoch": epoch + 1,
+            "train_epoch_loss": train_epoch_loss,
+            "dev_full_loss": dev_result["loss"],
+            "dev_full_mer": dev_result["mer"],
+        }
+        if train_subset_result is not None:
+            history_row["train_subset_loss"] = train_subset_result["loss"]
+            history_row["train_subset_mer"] = train_subset_result["mer"]
+            history_row["train_subset_unknown_tokens"] = train_subset_result["unknown_token_count"]
+            print(
+                f"train_subset_loss={train_subset_result['loss']:.6f} "
+                f"train_subset_mer={train_subset_result['mer']:.6f}"
+            )
+        if dev_subset_result is not None:
+            history_row["dev_subset_loss"] = dev_subset_result["loss"]
+            history_row["dev_subset_mer"] = dev_subset_result["mer"]
+            history_row["dev_subset_unknown_tokens"] = dev_subset_result["unknown_token_count"]
+            print(
+                f"dev_subset_loss={dev_subset_result['loss']:.6f} "
+                f"dev_subset_mer={dev_subset_result['mer']:.6f}"
+            )
+        overfit_history.append(history_row)
+        with (output_dir / "validation_progress.json").open("w", encoding="utf-8") as target:
+            json.dump(overfit_history, target, ensure_ascii=False, indent=2)
         if wandb is not None:
-            wandb.log({
+            log_row = {
                 "epoch": epoch + 1,
                 "train/epoch_loss": train_epoch_loss,
                 "dev/loss": dev_result["loss"],
@@ -516,7 +628,14 @@ def train(
                 "dev/MER/CN": dev_result["groups"].get("<CN>", {}).get("mer"),
                 "dev/MER/EN": dev_result["groups"].get("<EN>", {}).get("mer"),
                 "dev/MER/MIX": dev_result["groups"].get("<MIX>", {}).get("mer"),
-            })
+            }
+            if train_subset_result is not None:
+                log_row["train_subset/loss"] = train_subset_result["loss"]
+                log_row["train_subset/MER"] = train_subset_result["mer"]
+            if dev_subset_result is not None:
+                log_row["dev_subset/loss"] = dev_subset_result["loss"]
+                log_row["dev_subset/MER"] = dev_subset_result["mer"]
+            wandb.log(log_row)
 
         if should_replace_best_checkpoint(dev_result["mer"], best_mer):
             best_mer = dev_result["mer"]
@@ -529,6 +648,25 @@ def train(
         save_checkpoint(
             output_dir, f"epoch-{epoch + 1}", model, processor,
             optimizer, scheduler, epoch, global_step, best_mer,
+        )
+
+    final_full_dev_result = None
+    best_path = output_dir / "best"
+    if best_path.is_dir():
+        best_model = Wav2Vec2ForCTC.from_pretrained(
+            best_path, ctc_zero_infinity=True
+        ).to(device)
+        final_full_dev_result = evaluate(
+            best_model, dev_dataloader, processor, device,
+            mixed_precision=mixed_precision,
+        )
+        with (output_dir / "final_full_dev_metrics.json").open(
+            "w", encoding="utf-8"
+        ) as target:
+            json.dump(final_full_dev_result, target, ensure_ascii=False, indent=2)
+        print(
+            f"final_full_dev_loss={final_full_dev_result['loss']:.6f} "
+            f"final_full_dev_mer={final_full_dev_result['mer']:.6f}"
         )
 
     if wandb is not None:
@@ -544,6 +682,7 @@ def train(
         "output_dir": str(output_dir),
         "best_mer": best_mer,
         "global_step": global_step,
+        "final_full_dev": final_full_dev_result,
     }
 
 
@@ -619,6 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--disable-wandb", action="store_true")
     train_parser.add_argument("--max-train-samples", type=int)
     train_parser.add_argument("--max-steps", type=int)
+    train_parser.add_argument("--dev-subset-samples", type=int)
     train_parser.add_argument("--dry-run", action="store_true")
     train_parser.add_argument(
         "--device", choices=("auto", "cpu", "cuda", "mps"), default="auto"
@@ -671,6 +811,7 @@ def main(argv: list[str] | None = None) -> None:
         dataset_root=args.dataset_root,
         max_train_samples=args.max_train_samples,
         max_steps=args.max_steps,
+        dev_subset_samples=args.dev_subset_samples,
         dry_run=args.dry_run,
         device_selection=args.device,
     )

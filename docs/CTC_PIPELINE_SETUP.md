@@ -59,6 +59,7 @@ uv run python -m codeswitch_asr.finetune train `
   --dataset-root "$env:CS_DIALOGUE_ROOT" `
   --max-train-samples 50 `
   --max-steps 10 `
+  --dev-subset-samples 200 `
   --device cuda `
   --disable-wandb
 ```
@@ -85,6 +86,11 @@ uv run python -m codeswitch_asr.finetune evaluate `
   --split public_test `
   --device cuda
 ```
+
+The 50-sample run records fixed-subset train loss/MER and the configured dev
+subset loss/MER in `validation_progress.json`. Full official dev is still
+evaluated for intermediate model selection and re-evaluated from the best
+checkpoint after training.
 
 Use `--disable-wandb` for local-only runs or set `wandb.enabled: false` in the
 experiment YAML. Resume a previous run with

@@ -13,8 +13,10 @@ from codeswitch_asr.finetune import (
     get_device,
     load_training_state,
     load_yaml_config,
+    run_optimizer_step,
     save_checkpoint,
     should_replace_best_checkpoint,
+    validate_train_sets,
 )
 
 
@@ -41,6 +43,29 @@ def test_cli_train_limit_and_disable_wandb_flags():
     assert args.dry_run
     assert args.disable_wandb
     assert args.device == "cpu"
+
+
+def test_cli_accepts_configurable_dev_subset():
+    args = build_parser().parse_args([
+        "train", "--max-train-samples", "50",
+        "--dev-subset-samples", "200",
+    ])
+    assert args.max_train_samples == 50
+    assert args.dev_subset_samples == 200
+
+
+@pytest.mark.parametrize(
+    "train_sets",
+    [
+        ["public_train_noisy"],
+        ["public_train", "public_train_noisy"],
+        ["ours_train"],
+        [],
+    ],
+)
+def test_unsupported_training_sets_are_rejected(train_sets):
+    with pytest.raises(ValueError, match="public_train"):
+        validate_train_sets(train_sets)
 
 
 def test_public_test_evaluation_is_a_separate_explicit_cli():
@@ -130,3 +155,46 @@ def test_checkpoint_save_reload_training_state(tmp_path):
     assert state["epoch"] == 2
     assert state["global_step"] == 17
     assert state["best_mer"] == pytest.approx(0.123)
+
+
+class _NoOpScaler:
+    def unscale_(self, optimizer):
+        return None
+
+    def step(self, optimizer):
+        optimizer.step()
+
+    def update(self):
+        return None
+
+
+def test_synthetic_gradient_accumulation_and_checkpoint_reload(tmp_path):
+    model = torch.nn.Linear(2, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    scaler = _NoOpScaler()
+
+    optimizer.zero_grad()
+    initial = model.weight.detach().clone()
+    (model(torch.tensor([[1.0, 0.0]])).sum() / 2).backward()
+    assert model.weight.grad is not None
+    assert torch.equal(initial, model.weight.detach())
+
+    (model(torch.tensor([[0.0, 1.0]])).sum() / 2).backward()
+    run_optimizer_step(model, optimizer, scaler, scheduler, max_grad_norm=1.0)
+    assert not torch.equal(initial, model.weight.detach())
+    assert scheduler.last_epoch == 1
+
+    destination = save_checkpoint(
+        tmp_path,
+        "best",
+        _DummyModel(),
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=0,
+        global_step=1,
+        best_mer=0.5,
+    )
+    state = load_training_state(destination)
+    assert state["optimizer"] is not None
+    assert state["scheduler"]["last_epoch"] == 1
