@@ -50,8 +50,51 @@ $env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
 uv run python -m codeswitch_asr.finetune --config configs/ft_cs_dialogue.yaml
 ```
 
+For a reproducible 50-utterance / 10-optimizer-step CPU or workstation check:
+
+```powershell
+$env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
+uv run python -m codeswitch_asr.finetune train `
+  --config configs/ft_cs_dialogue.yaml `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --max-train-samples 50 `
+  --max-steps 10 `
+  --device cuda `
+  --disable-wandb
+```
+
+Dry-run (no model download or training):
+
+```powershell
+uv run python -m codeswitch_asr.finetune train `
+  --config configs/ft_cs_dialogue.yaml `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --max-train-samples 50 `
+  --max-steps 10 `
+  --device cpu `
+  --dry-run `
+  --disable-wandb
+```
+
+Public test evaluation is deliberately separate and never affects model selection:
+
+```powershell
+uv run python -m codeswitch_asr.finetune evaluate `
+  --checkpoint "checkpoints\ft_cs_dialogue\best" `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --split public_test `
+  --device cuda
+```
+
 Use `--disable-wandb` for local-only runs or set `wandb.enabled: false` in the
 experiment YAML. Resume a previous run with
 `--resume-from-checkpoint checkpoints/ft_cs_dialogue/best`.
+
+## Experiment status
+
+- `ft_cs_dialogue.yaml`: implemented clean public-train pipeline.
+- `ft_cs_dialogue_noise.yaml`: configuration present; room-tone/reverb augmentation is not implemented yet.
+- `ft_cs_dialogue_noise_ours.yaml`: configuration present; private-recording collection and in-domain training data are not implemented yet.
+- No full GPU training or 50-sample overfit validation is claimed by this repository snapshot.
 
 Do not commit any `.wav`, processed manifest, model weight, or HF cache to the public repository.

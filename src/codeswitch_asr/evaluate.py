@@ -26,6 +26,7 @@ def greedy_ctc_decode(
     processor: Any,
     *,
     blank_id: int | None = None,
+    output_lengths: torch.Tensor | list[int] | None = None,
 ) -> list[str]:
     """Collapse frame-level CTC predictions into text hypotheses.
 
@@ -54,7 +55,16 @@ def greedy_ctc_decode(
     )
 
     hypotheses: list[str] = []
-    for row in token_ids.detach().cpu().tolist():
+    if output_lengths is None:
+        lengths = [row.shape[0] for row in token_ids]
+    elif isinstance(output_lengths, torch.Tensor):
+        lengths = output_lengths.detach().cpu().tolist()
+    else:
+        lengths = list(output_lengths)
+
+    for row_index, row in enumerate(token_ids.detach().cpu().tolist()):
+        length = min(int(lengths[row_index]), len(row))
+        row = row[:length]
         previous = None
         tokens: list[str] = []
         for token_id in row:
@@ -75,12 +85,35 @@ def greedy_ctc_decode(
                     (text for text, index in inverse.items() if index == token_id),
                     "[UNK]",
                 )
-            if token not in (None, "", "[UNK]", "<blank>", "<s>", "</s>"):
+            if token not in (None, "", "<blank>", "<s>", "</s>"):
                 tokens.append(str(token))
 
         text = "".join(tokens).replace("|", " ")
         hypotheses.append(" ".join(text.split()))
     return hypotheses
+
+
+def greedy_ctc_decode_with_stats(
+    predictions: torch.Tensor,
+    processor: Any,
+    *,
+    blank_id: int | None = None,
+    output_lengths: torch.Tensor | list[int] | None = None,
+) -> dict[str, Any]:
+    """Decode CTC and report [UNK] emissions without changing MER normalization."""
+    hypotheses = greedy_ctc_decode(
+        predictions,
+        processor,
+        blank_id=blank_id,
+        output_lengths=output_lengths,
+    )
+    unknown_count = sum(hypothesis.count("[UNK]") for hypothesis in hypotheses)
+    unknown_utterances = sum("[UNK]" in hypothesis for hypothesis in hypotheses)
+    return {
+        "hypotheses": hypotheses,
+        "unknown_token_count": unknown_count,
+        "unknown_utterance_count": unknown_utterances,
+    }
 
 
 def compute_mer(refs: list[str], hyps: list[str]) -> dict:

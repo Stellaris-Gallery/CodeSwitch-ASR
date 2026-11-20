@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import random
-import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +27,10 @@ from codeswitch_asr.data import (
     load_official_eval_split,
     load_train_manifest,
 )
-from codeswitch_asr.evaluate import compute_mer_by_group, greedy_ctc_decode
+from codeswitch_asr.evaluate import (
+    compute_mer_by_group,
+    greedy_ctc_decode_with_stats,
+)
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
@@ -65,7 +67,20 @@ load_config = load_yaml_config
 configure_determinism = set_seed
 
 
-def get_device() -> torch.device:
+def get_device(selection: str = "auto") -> torch.device:
+    selection = selection.lower()
+    if selection == "cpu":
+        return torch.device("cpu")
+    if selection == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was explicitly requested but is unavailable")
+        return torch.device("cuda")
+    if selection == "mps":
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            raise RuntimeError("MPS was explicitly requested but is unavailable")
+        return torch.device("mps")
+    if selection != "auto":
+        raise ValueError("device must be one of: auto, cpu, cuda, mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -113,6 +128,18 @@ def save_checkpoint(
     return destination
 
 
+def load_training_state(path: str | Path) -> dict[str, Any] | None:
+    state_path = Path(path) / "training_state.pt"
+    if not state_path.is_file():
+        return None
+    return torch.load(state_path, map_location="cpu", weights_only=False)
+
+
+def should_replace_best_checkpoint(candidate_mer: float, best_mer: float) -> bool:
+    """Best checkpoint selection uses dev MER only and never test MER."""
+    return candidate_mer < best_mer
+
+
 def evaluate(
     model,
     dataloader,
@@ -128,11 +155,12 @@ def evaluate(
     refs: list[str] = []
     hyps: list[str] = []
     groups: list[str] = []
+    unknown_token_count = 0
+    unknown_utterance_count = 0
     use_cuda_autocast = device.type == "cuda" and mixed_precision in ("fp16", "bf16")
 
     with torch.no_grad():
         for batch in dataloader:
-            ids = batch.pop("_ids", None)
             texts = batch.pop("_texts", None)
             tags = batch.pop("_tags", None)
             batch = {key: value.to(device) for key, value in batch.items()}
@@ -145,11 +173,18 @@ def evaluate(
             loss_sum += float(output.loss.detach().cpu()) * batch["input_values"].size(0)
             sample_count += batch["input_values"].size(0)
 
-            logits = model(
-                input_values=batch["input_values"],
-                attention_mask=batch.get("attention_mask"),
-            ).logits
-            hyps.extend(greedy_ctc_decode(logits, processor))
+            output_lengths = None
+            if batch.get("attention_mask") is not None:
+                input_lengths = batch["attention_mask"].sum(dim=-1)
+                output_lengths = model._get_feat_extract_output_lengths(input_lengths)
+            decoded = greedy_ctc_decode_with_stats(
+                output.logits,
+                processor,
+                output_lengths=output_lengths,
+            )
+            hyps.extend(decoded["hypotheses"])
+            unknown_token_count += decoded["unknown_token_count"]
+            unknown_utterance_count += decoded["unknown_utterance_count"]
             if texts is not None:
                 refs.extend(texts)
             if tags is not None:
@@ -164,6 +199,8 @@ def evaluate(
         "loss": loss_sum / max(sample_count, 1),
         "mer": mer["ALL"]["mer"],
         "groups": mer,
+        "unknown_token_count": unknown_token_count,
+        "unknown_utterance_count": unknown_utterance_count,
     }
 
 
@@ -172,11 +209,33 @@ def _batch_metadata(dataset, indices: list[int]) -> dict[str, list[str]]:
     return {"texts": [row.text for row in rows], "tags": [row.tag for row in rows]}
 
 
-def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> dict[str, Any]:
+def apply_duration_limit(
+    records: list[Any],
+    max_duration_seconds: float | None,
+) -> tuple[list[Any], list[Any]]:
+    """Filter only caller-provided training records; never filter evaluation records."""
+    if max_duration_seconds is None:
+        return records, []
+    if max_duration_seconds <= 0:
+        raise ValueError("max_train_duration_seconds must be positive")
+    kept = [row for row in records if float(row.duration) <= max_duration_seconds]
+    excluded = [row for row in records if float(row.duration) > max_duration_seconds]
+    return kept, excluded
+
+
+def train(
+    config: dict[str, Any],
+    *,
+    dataset_root: str | Path | None = None,
+    max_train_samples: int | None = None,
+    max_steps: int | None = None,
+    dry_run: bool = False,
+    device_selection: str = "auto",
+) -> dict[str, Any]:
     """Run one-GPU CTC training from a validated experiment config."""
     seed = int(config.get("seed", 0))
     set_seed(seed)
-    device = get_device()
+    device = get_device(device_selection)
 
     data_config_path = Path(config["data_config"])
     if not data_config_path.is_absolute():
@@ -193,9 +252,48 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
     root = Path(dataset_root).resolve()
     vocab_path = root / vocab_config["path"]
 
-    processor = build_processor(vocab_path, config["base_model"])
     train_records = load_train_manifest(root, check_files=True)
     dev_records = load_official_eval_split(root, "dev")
+
+    max_duration = config.get("max_train_duration_seconds")
+    if max_duration is not None:
+        max_duration = float(max_duration)
+    train_records, excluded_records = apply_duration_limit(train_records, max_duration)
+    if max_train_samples is not None:
+        if max_train_samples <= 0:
+            raise ValueError("max_train_samples must be positive")
+        train_records = train_records[:max_train_samples]
+    if not train_records:
+        raise ValueError("No training samples remain after limits")
+    if max_steps is not None and max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    output_dir = _safe_output_dir(config.get("output_dir", f"checkpoints/{config['run_name']}"))
+    if excluded_records:
+        exclusion_report = {
+            "criterion": "duration",
+            "max_train_duration_seconds": max_duration,
+            "excluded_count": len(excluded_records),
+            "excluded_ids": [row.id for row in excluded_records],
+        }
+        with (output_dir / "train_exclusions.json").open("w", encoding="utf-8") as target:
+            json.dump(exclusion_report, target, ensure_ascii=False, indent=2)
+
+    if dry_run:
+        plan = {
+            "dry_run": True,
+            "device": str(device),
+            "train_samples": len(train_records),
+            "dev_samples": len(dev_records),
+            "excluded_train_duration": len(excluded_records),
+            "max_train_samples": max_train_samples,
+            "max_steps": max_steps,
+            "base_model": config["base_model"],
+            "mixed_precision": config.get("mixed_precision", "bf16"),
+            "public_test": "not evaluated unless a separate evaluation command is used",
+        }
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return plan
+    processor = build_processor(vocab_path, config["base_model"])
     train_dataset = CSDialogueCTCDataset(train_records, processor)
     dev_dataset = CSDialogueCTCDataset(dev_records, processor, allow_oov=True)
     collator = CTCDataCollator(processor)
@@ -253,7 +351,13 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
 
     epochs = int(config.get("epochs", 5))
     accumulation = int(config.get("gradient_accumulation_steps", 1))
-    total_steps = max(1, (len(train_dataloader) + accumulation - 1) // accumulation * epochs)
+    steps_per_epoch = (len(train_dataloader) + accumulation - 1) // accumulation
+    if max_steps is not None:
+        scheduled_epochs = min(epochs, (max_steps + steps_per_epoch - 1) // steps_per_epoch)
+        total_steps = min(max_steps, steps_per_epoch * epochs)
+    else:
+        scheduled_epochs = epochs
+        total_steps = steps_per_epoch * epochs
     warmup_steps = int(config.get("warmup_steps", 0))
     warmup_ratio = float(config.get("warmup_ratio", 0.0))
     if warmup_steps == 0 and warmup_ratio:
@@ -268,10 +372,13 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
             optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
         )
 
-    output_dir = _safe_output_dir(config.get("output_dir", f"checkpoints/{config['run_name']}"))
     mixed_precision = str(config.get("mixed_precision", "fp16")).lower()
     if device.type != "cuda":
         mixed_precision = "fp32"
+    elif mixed_precision == "bf16":
+        major, minor = torch.cuda.get_device_capability(device)
+        if (major, minor) < (8, 0):
+            mixed_precision = "fp16"
     scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision == "fp16" and device.type == "cuda")
 
     wandb_config = config.get("wandb", {})
@@ -296,22 +403,30 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
     global_step = 0
     best_mer = float("inf")
     if resume_path:
-        state_path = Path(resume_path) / "training_state.pt"
-        if state_path.is_file():
-            state = torch.load(state_path, map_location="cpu", weights_only=False)
+        state = load_training_state(resume_path)
+        if state is not None:
             start_epoch = int(state["epoch"]) + 1
             global_step = int(state["global_step"])
             best_mer = float(state["best_mer"])
-            optimizer.load_state_dict(state["optimizer"])
-            if state["scheduler"] is not None:
+            if state.get("optimizer") is not None:
+                optimizer.load_state_dict(state["optimizer"])
+            if state.get("scheduler") is not None:
                 scheduler.load_state_dict(state["scheduler"])
+            rng = state.get("rng")
+            if rng:
+                random.setstate(rng["python"])
+                np.random.set_state(rng["numpy"])
+                torch.random.set_rng_state(rng["torch"])
 
     max_grad_norm = float(config.get("max_grad_norm", 1.0))
     unfreeze_epoch = config.get("feature_encoder_unfreeze_epoch")
     if unfreeze_epoch is not None:
         unfreeze_epoch = int(unfreeze_epoch)
 
-    for epoch in range(start_epoch, epochs):
+    stop_training = False
+    for epoch in range(start_epoch, scheduled_epochs):
+        if stop_training:
+            break
         if unfreeze_epoch is not None and epoch >= unfreeze_epoch:
             for parameter in model.wav2vec2.feature_encoder.parameters():
                 parameter.requires_grad = True
@@ -319,20 +434,33 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        epoch_loss_sum = 0.0
+        epoch_micro_batches = 0
         running_loss = 0.0
+        running_micro_batches = 0
+        optimizer_steps_this_epoch = 0
         for step, batch in enumerate(train_dataloader):
+            if max_steps is not None and global_step >= max_steps:
+                stop_training = True
+                break
             batch = {key: value.to(device) for key, value in batch.items()}
             dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16
             if device.type == "cuda" and mixed_precision in ("fp16", "bf16"):
                 with torch.amp.autocast("cuda", dtype=dtype):
-                    loss = model(**batch).loss / accumulation
+                    micro_loss = model(**batch).loss
+                    loss = micro_loss / accumulation
             else:
-                loss = model(**batch).loss / accumulation
+                micro_loss = model(**batch).loss
+                loss = micro_loss / accumulation
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss at epoch {epoch + 1}, step {step}")
 
             scaler.scale(loss).backward()
-            running_loss += float(loss.detach().cpu()) * accumulation
+            micro_loss_value = float(micro_loss.detach().cpu())
+            running_loss += micro_loss_value
+            epoch_loss_sum += micro_loss_value
+            running_micro_batches += 1
+            epoch_micro_batches += 1
 
             if (step + 1) % accumulation == 0:
                 scaler.unscale_(optimizer)
@@ -342,15 +470,18 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 global_step += 1
+                optimizer_steps_this_epoch += 1
                 if wandb is not None:
                     wandb.log({
-                        "train/loss": running_loss / ((step % accumulation) + 1),
+                        "train/loss": running_loss / max(running_micro_batches, 1),
                         "train/lr": scheduler.get_last_lr()[0],
                         "train/global_step": global_step,
                     })
+                running_loss = 0.0
+                running_micro_batches = 0
 
         # Perform an optimizer step for a partial final accumulation block.
-        if len(train_dataloader) % accumulation != 0:
+        if not stop_training and running_micro_batches > 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
@@ -358,18 +489,28 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             global_step += 1
+            optimizer_steps_this_epoch += 1
+            if wandb is not None:
+                wandb.log({
+                    "train/loss": running_loss / max(running_micro_batches, 1),
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/global_step": global_step,
+                })
 
         dev_result = evaluate(
             model, dev_dataloader, processor, device,
             mixed_precision=mixed_precision,
         )
+        train_epoch_loss = epoch_loss_sum / max(epoch_micro_batches, 1)
         print(
-            f"epoch={epoch + 1} dev_loss={dev_result['loss']:.6f} "
+            f"epoch={epoch + 1} train_loss={train_epoch_loss:.6f} "
+            f"dev_loss={dev_result['loss']:.6f} "
             f"dev_mer={dev_result['mer']:.6f}"
         )
         if wandb is not None:
             wandb.log({
                 "epoch": epoch + 1,
+                "train/epoch_loss": train_epoch_loss,
                 "dev/loss": dev_result["loss"],
                 "dev/MER": dev_result["mer"],
                 "dev/MER/CN": dev_result["groups"].get("<CN>", {}).get("mer"),
@@ -377,7 +518,7 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
                 "dev/MER/MIX": dev_result["groups"].get("<MIX>", {}).get("mer"),
             })
 
-        if dev_result["mer"] < best_mer:
+        if should_replace_best_checkpoint(dev_result["mer"], best_mer):
             best_mer = dev_result["mer"]
             save_checkpoint(
                 output_dir, "best", model, processor,
@@ -389,54 +530,6 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
             output_dir, f"epoch-{epoch + 1}", model, processor,
             optimizer, scheduler, epoch, global_step, best_mer,
         )
-
-    final_results: dict[str, Any] = {}
-    if "public_test" in set(config.get("final_eval_sets", [])):
-        test_records = load_official_eval_split(root, "test")
-        test_dataset = CSDialogueCTCDataset(test_records, processor, allow_oov=True)
-
-        def test_collate(features):
-            batch = collator(features)
-            batch["_texts"] = [item["text"] for item in features]
-            batch["_tags"] = [
-                next(row.tag for row in test_dataset.records if row.id == item["id"])
-                for item in features
-            ]
-            return batch
-
-        test_dataloader = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=workers,
-            collate_fn=test_collate,
-            pin_memory=device.type == "cuda",
-        )
-        best_path = output_dir / "best"
-        if best_path.is_dir():
-            final_model = Wav2Vec2ForCTC.from_pretrained(
-                best_path, ctc_zero_infinity=True
-            ).to(device)
-            test_result = evaluate(
-                final_model, test_dataloader, processor, device,
-                mixed_precision=mixed_precision,
-            )
-            final_results["public_test"] = test_result
-            print(
-                f"public_test_loss={test_result['loss']:.6f} "
-                f"public_test_mer={test_result['mer']:.6f}"
-            )
-            with (output_dir / "public_test_metrics.json").open(
-                "w", encoding="utf-8"
-            ) as target:
-                json.dump(test_result, target, ensure_ascii=False, indent=2)
-            if wandb is not None:
-                wandb.log({
-                    "test/MER": test_result["mer"],
-                    "test/MER/CN": test_result["groups"].get("<CN>", {}).get("mer"),
-                    "test/MER/EN": test_result["groups"].get("<EN>", {}).get("mer"),
-                    "test/MER/MIX": test_result["groups"].get("<MIX>", {}).get("mer"),
-                })
 
     if wandb is not None:
         artifact = wandb.Artifact(
@@ -451,18 +544,116 @@ def train(config: dict[str, Any], *, dataset_root: str | Path | None = None) -> 
         "output_dir": str(output_dir),
         "best_mer": best_mer,
         "global_step": global_step,
-        "final_eval": final_results,
     }
 
 
-def main() -> None:
+def evaluate_public_test(
+    checkpoint: str | Path,
+    *,
+    dataset_root: str | Path | None = None,
+    base_model: str = "facebook/wav2vec2-xls-r-300m",
+    batch_size: int = 8,
+    device_selection: str = "auto",
+    mixed_precision: str = "bf16",
+) -> dict[str, Any]:
+    """Explicitly evaluate the held-out official public test split."""
+    checkpoint = Path(checkpoint)
+    if not checkpoint.is_dir():
+        raise ValueError(f"Checkpoint directory not found: {checkpoint}")
+    data_config = load_yaml_config("configs/ft_cs_dialogue.yaml")
+    with Path(data_config["data_config"]).open(encoding="utf-8") as source:
+        public_config = yaml.safe_load(source)
+    public = public_config["public"]
+    vocab_config = public_config["vocab"]
+    if dataset_root is None:
+        dataset_root = os.environ.get(public["root_env"])
+    if dataset_root is None:
+        raise ValueError(f"Supply --dataset-root or set {public['root_env']}")
+
+    root = Path(dataset_root).resolve()
+    processor = build_processor(root / vocab_config["path"], base_model)
+    test_records = load_official_eval_split(root, "test")
+    test_dataset = CSDialogueCTCDataset(test_records, processor, allow_oov=True)
+    collator = CTCDataCollator(processor)
+
+    def test_collate(features):
+        batch = collator(features)
+        batch["_texts"] = [item["text"] for item in features]
+        batch["_tags"] = [
+            next(row.tag for row in test_dataset.records if row.id == item["id"])
+            for item in features
+        ]
+        return batch
+
+    device = get_device(device_selection)
+    dataloader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=test_collate,
+        pin_memory=device.type == "cuda",
+    )
+    model = Wav2Vec2ForCTC.from_pretrained(
+        checkpoint, ctc_zero_infinity=True
+    ).to(device)
+    result = evaluate(model, dataloader, processor, device, mixed_precision=mixed_precision)
+    print(
+        f"public_test_loss={result['loss']:.6f} "
+        f"public_test_mer={result['mer']:.6f}"
+    )
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/ft_cs_dialogue.yaml")
-    parser.add_argument("--dataset-root", type=Path)
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--resume-from-checkpoint", type=Path)
-    parser.add_argument("--disable-wandb", action="store_true")
-    args = parser.parse_args()
+    subparsers = parser.add_subparsers(dest="command")
+
+    train_parser = subparsers.add_parser("train", help="Fine-tune XLS-R-300M")
+    train_parser.add_argument("--config", default="configs/ft_cs_dialogue.yaml")
+    train_parser.add_argument("--dataset-root", type=Path)
+    train_parser.add_argument("--output-dir", type=Path)
+    train_parser.add_argument("--resume-from-checkpoint", type=Path)
+    train_parser.add_argument("--disable-wandb", action="store_true")
+    train_parser.add_argument("--max-train-samples", type=int)
+    train_parser.add_argument("--max-steps", type=int)
+    train_parser.add_argument("--dry-run", action="store_true")
+    train_parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda", "mps"), default="auto"
+    )
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate", help="Evaluate a checkpoint on an explicitly selected official split"
+    )
+    evaluate_parser.add_argument("--checkpoint", type=Path, required=True)
+    evaluate_parser.add_argument("--dataset-root", type=Path)
+    evaluate_parser.add_argument(
+        "--split", choices=("public_test",), required=True
+    )
+    evaluate_parser.add_argument("--batch-size", type=int, default=8)
+    evaluate_parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda", "mps"), default="auto"
+    )
+    evaluate_parser.add_argument("--mixed-precision", choices=("fp32", "fp16", "bf16"), default="bf16")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] not in ("train", "evaluate"):
+        argv = ["train", *argv]
+
+    args = build_parser().parse_args(argv)
+    if args.command == "evaluate":
+        result = evaluate_public_test(
+            args.checkpoint,
+            dataset_root=args.dataset_root,
+            batch_size=args.batch_size,
+            device_selection=args.device,
+            mixed_precision=args.mixed_precision,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
 
     config = load_yaml_config(args.config)
     if args.output_dir:
@@ -471,7 +662,14 @@ def main() -> None:
         config["resume_from_checkpoint"] = str(args.resume_from_checkpoint)
     if args.disable_wandb:
         config["_disable_wandb"] = True
-    result = train(config, dataset_root=args.dataset_root)
+    result = train(
+        config,
+        dataset_root=args.dataset_root,
+        max_train_samples=args.max_train_samples,
+        max_steps=args.max_steps,
+        dry_run=args.dry_run,
+        device_selection=args.device,
+    )
     print(json.dumps(result, ensure_ascii=False))
 
 
