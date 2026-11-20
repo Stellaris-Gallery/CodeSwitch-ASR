@@ -551,7 +551,7 @@ def evaluate_public_test(
     checkpoint: str | Path,
     *,
     dataset_root: str | Path | None = None,
-    base_model: str = "facebook/wav2vec2-xls-r-300m",
+    config_path: str | Path = "configs/ft_cs_dialogue.yaml",
     batch_size: int = 8,
     device_selection: str = "auto",
     mixed_precision: str = "bf16",
@@ -560,7 +560,9 @@ def evaluate_public_test(
     checkpoint = Path(checkpoint)
     if not checkpoint.is_dir():
         raise ValueError(f"Checkpoint directory not found: {checkpoint}")
-    data_config = load_yaml_config("configs/ft_cs_dialogue.yaml")
+    experiment_config = load_yaml_config(config_path)
+    base_model = experiment_config["base_model"]
+    data_config = experiment_config
     with Path(data_config["data_config"]).open(encoding="utf-8") as source:
         public_config = yaml.safe_load(source)
     public = public_config["public"]
@@ -626,6 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
         "evaluate", help="Evaluate a checkpoint on an explicitly selected official split"
     )
     evaluate_parser.add_argument("--checkpoint", type=Path, required=True)
+    evaluate_parser.add_argument("--config", default="configs/ft_cs_dialogue.yaml")
     evaluate_parser.add_argument("--dataset-root", type=Path)
     evaluate_parser.add_argument(
         "--split", choices=("public_test",), required=True
@@ -648,6 +651,7 @@ def main(argv: list[str] | None = None) -> None:
         result = evaluate_public_test(
             args.checkpoint,
             dataset_root=args.dataset_root,
+            config_path=args.config,
             batch_size=args.batch_size,
             device_selection=args.device,
             mixed_precision=args.mixed_precision,
