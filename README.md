@@ -72,7 +72,7 @@ PyTorch (an NVIDIA driver is required); on macOS it installs the default build (
 ```bash
 uv sync                                                          # 1. build the environment
 uv run python scripts/prepare_data.py --config configs/data.yaml # 2. download / prepare data
-uv run python -m codeswitch_asr.finetune --config configs/ft_ascend.yaml  # 3. fine-tune
+uv run python -m codeswitch_asr.finetune --config configs/ft_cs_dialogue.yaml  # 3. fine-tune
 ```
 
 TODO: zero-shot and evaluation commands.

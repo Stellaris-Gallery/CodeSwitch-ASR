@@ -37,6 +37,21 @@ uv run python scripts/smoke_ctc_data.py --dataset-root "$env:CS_DIALOGUE_ROOT" -
 
 ## Next milestone
 
-Implement `finetune.py`, validation MER, W&B logging, checkpoint saving, and a training config for 1-GPU runs, with explicit epoch/batch and mixed-precision settings. Only after a stable single-GPU run should distributed GPU training be considered.
+`finetune.py` now provides the 1-GPU CTC training entry point. It loads the
+train-only vocabulary, fine-tunes the XLS-R CTC head, evaluates the official
+dev split for model selection, logs metrics/config/checkpoints to W&B, and runs
+the official public test split only after training. Private `ours_test`
+checkpoints remain outside this repository.
+
+Run a 1-GPU experiment with:
+
+```powershell
+$env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
+uv run python -m codeswitch_asr.finetune --config configs/ft_cs_dialogue.yaml
+```
+
+Use `--disable-wandb` for local-only runs or set `wandb.enabled: false` in the
+experiment YAML. Resume a previous run with
+`--resume-from-checkpoint checkpoints/ft_cs_dialogue/best`.
 
 Do not commit any `.wav`, processed manifest, model weight, or HF cache to the public repository.
