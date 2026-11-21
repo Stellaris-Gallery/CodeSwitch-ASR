@@ -102,4 +102,30 @@ experiment YAML. Resume a previous run with
 - `ft_cs_dialogue_noise_ours.yaml`: configuration present; private-recording collection and in-domain training data are not implemented yet.
 - No full GPU training or 50-sample overfit validation is claimed by this repository snapshot.
 
+## CTC numerical stability diagnostics
+
+`ctc_loss_reduction` is configurable and defaults to `sum` for existing
+configs. The small overfit profiles use `mean`:
+
+- `sum` accumulates the per-batch CTC loss scale across every target frame.
+- `mean` normalizes CTC loss by target lengths and can reduce batch-size/duration scaling.
+
+This difference is not presented as a proven cause of blank collapse.
+
+Training diagnostics are written to `validation_progress.json` and stdout:
+CTC input/target lengths, blank and nonblank frame counts, total/head gradient
+norms, finite/nonzero CTC-head gradients, and whether head parameters changed.
+
+Run the fresh 8-sample diagnosis (do not resume collapsed checkpoints):
+
+```powershell
+$env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
+uv run python -m codeswitch_asr.finetune train `
+  --config configs/ft_cs_dialogue_tiny_overfit.yaml `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --max-steps 200 `
+  --device cuda `
+  --disable-wandb
+```
+
 Do not commit any `.wav`, processed manifest, model weight, or HF cache to the public repository.

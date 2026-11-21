@@ -18,6 +18,7 @@ warmup_ratio: 0.1
 warmup_steps: 0
 scheduler: linear
 mixed_precision: bf16
+ctc_loss_reduction: sum
 freeze_feature_encoder: true
 feature_encoder_unfreeze_epoch: null
 max_grad_norm: 1.0

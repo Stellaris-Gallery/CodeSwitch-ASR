@@ -62,6 +62,13 @@ def validate_train_sets(train_sets: list[str]) -> None:
         )
 
 
+def validate_ctc_loss_reduction(value: str) -> str:
+    value = str(value).lower()
+    if value not in ("mean", "sum"):
+        raise ValueError("ctc_loss_reduction must be 'mean' or 'sum'")
+    return value
+
+
 def set_seed(seed: int) -> None:
     """Make CPU/Python/GPU random operations reproducible where supported."""
     random.seed(seed)
@@ -262,6 +269,85 @@ def run_optimizer_step(
     return 1
 
 
+def ctc_diagnostics(
+    model,
+    logits: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+    blank_id: int,
+) -> dict[str, Any]:
+    """Report CTC frame, target, and blank-collapse diagnostics."""
+    predictions = logits.argmax(dim=-1)
+    if batch.get("attention_mask") is not None:
+        input_lengths = batch["attention_mask"].sum(dim=-1)
+        output_lengths = model._get_feat_extract_output_lengths(input_lengths)
+    else:
+        output_lengths = torch.full(
+            (logits.size(0),),
+            logits.size(1),
+            dtype=torch.long,
+            device=logits.device,
+        )
+    output_lengths_cpu = output_lengths.detach().cpu()
+    blank_counts = torch.zeros(logits.size(0), dtype=torch.long)
+    nonblank_counts = torch.zeros(logits.size(0), dtype=torch.long)
+    blank_ratios: list[float] = []
+    for row_index, frame_count in enumerate(output_lengths_cpu.tolist()):
+        frame_count = int(frame_count)
+        row_predictions = predictions[row_index, :frame_count]
+        blanks = int((row_predictions == blank_id).sum().cpu())
+        blank_counts[row_index] = blanks
+        nonblank_counts[row_index] = frame_count - blanks
+        blank_ratios.append(blanks / frame_count if frame_count else 0.0)
+
+    target_lengths = (batch["labels"] != -100).sum(dim=-1).detach().cpu()
+    return {
+        "ctc_input_lengths": [int(value) for value in output_lengths_cpu.tolist()],
+        "ctc_target_lengths": [int(value) for value in target_lengths.tolist()],
+        "blank_prediction_ratio_mean": float(sum(blank_ratios) / max(len(blank_ratios), 1)),
+        "blank_prediction_counts": [int(value) for value in blank_counts.tolist()],
+        "nonblank_prediction_counts": [int(value) for value in nonblank_counts.tolist()],
+    }
+
+
+def gradient_diagnostics(model) -> dict[str, Any]:
+    """Return finite/nonzero gradient diagnostics for CTC training."""
+    total_squared = 0.0
+    head_grad_norm = 0.0
+    lm_head = getattr(model, "lm_head", None)
+    head_grad: torch.Tensor | None = getattr(lm_head, "weight", None)
+    if head_grad is None:
+        head_grad = getattr(model, "weight", None)
+    if head_grad is not None and head_grad.grad is not None:
+        gradient = head_grad.grad.detach().float()
+        head_grad_norm = float(torch.linalg.vector_norm(gradient).cpu())
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        gradient = parameter.grad.detach().float()
+        if not bool(torch.isfinite(gradient).all()):
+            return {
+                "total_gradient_norm": float("inf"),
+                "head_gradient_norm": head_grad_norm,
+                "head_has_finite_gradient": False,
+                "head_has_nonzero_gradient": False,
+            }
+        total_squared += float(torch.sum(gradient * gradient).cpu())
+    finite_head = bool(torch.isfinite(torch.tensor(head_grad_norm)))
+    return {
+        "total_gradient_norm": float(total_squared ** 0.5),
+        "head_gradient_norm": head_grad_norm,
+        "head_has_finite_gradient": finite_head,
+        "head_has_nonzero_gradient": head_grad_norm > 0.0,
+    }
+
+
+def ctc_head_parameters_changed(model, before: dict[str, torch.Tensor]) -> bool:
+    for name, parameter in model.lm_head.named_parameters():
+        if name in before and not torch.equal(parameter.detach().cpu(), before[name]):
+            return True
+    return False
+
+
 def train(
     config: dict[str, Any],
     *,
@@ -275,6 +361,14 @@ def train(
     """Run one-GPU CTC training from a validated experiment config."""
     seed = int(config.get("seed", 0))
     set_seed(seed)
+    ctc_loss_reduction = validate_ctc_loss_reduction(
+        config.get("ctc_loss_reduction", "sum")
+    )
+    if config.get("require_fresh_checkpoint", False) and config.get("resume_from_checkpoint"):
+        raise ValueError(
+            "This experiment requires a fresh XLS-R-300M/pretrained CTC head; "
+            "resume-from-checkpoint is not allowed."
+        )
     device = get_device(device_selection)
 
     data_config_path = Path(config["data_config"])
@@ -303,6 +397,11 @@ def train(
         if max_train_samples <= 0:
             raise ValueError("max_train_samples must be positive")
         train_records = train_records[:max_train_samples]
+    elif config.get("train_sample_limit") is not None:
+        train_sample_limit = int(config["train_sample_limit"])
+        if train_sample_limit <= 0:
+            raise ValueError("train_sample_limit must be positive")
+        train_records = train_records[:train_sample_limit]
     if not train_records:
         raise ValueError("No training samples remain after limits")
     if max_steps is not None and max_steps <= 0:
@@ -428,6 +527,7 @@ def train(
         model = Wav2Vec2ForCTC.from_pretrained(
             resume_path,
             ctc_zero_infinity=True,
+            ctc_loss_reduction=ctc_loss_reduction,
         ).to(device)
     else:
         model = Wav2Vec2ForCTC.from_pretrained(
@@ -436,10 +536,12 @@ def train(
             pad_token_id=processor.tokenizer.pad_token_id,
             ignore_mismatched_sizes=True,
             ctc_zero_infinity=True,
+            ctc_loss_reduction=ctc_loss_reduction,
         ).to(device)
 
     if bool(config.get("freeze_feature_encoder", True)):
         model.freeze_feature_encoder()
+    model.config.ctc_loss_reduction = ctc_loss_reduction
 
     optimizer_config = config.get("optimizer", {})
     learning_rate = float(optimizer_config.get("lr", 1e-4))
@@ -538,6 +640,8 @@ def train(
         running_loss = 0.0
         running_micro_batches = 0
         optimizer_steps_this_epoch = 0
+        diagnostics_last: dict[str, Any] | None = None
+        head_changed_any = False
         for step, batch in enumerate(train_dataloader):
             if max_steps is not None and global_step >= max_steps:
                 stop_training = True
@@ -546,15 +650,22 @@ def train(
             dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16
             if device.type == "cuda" and mixed_precision in ("fp16", "bf16"):
                 with torch.amp.autocast("cuda", dtype=dtype):
-                    micro_loss = model(**batch).loss
+                    output = model(**batch)
+                    micro_loss = output.loss
                     loss = micro_loss / accumulation
             else:
-                micro_loss = model(**batch).loss
+                output = model(**batch)
+                micro_loss = output.loss
                 loss = micro_loss / accumulation
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss at epoch {epoch + 1}, step {step}")
 
             scaler.scale(loss).backward()
+            diagnostics_last = ctc_diagnostics(
+                model, output.logits, batch, processor.tokenizer.pad_token_id
+            )
+            diagnostics_last.update(gradient_diagnostics(model))
+            diagnostics_last["ctc_loss_reduction"] = ctc_loss_reduction
             micro_loss_value = float(micro_loss.detach().cpu())
             running_loss += micro_loss_value
             epoch_loss_sum += micro_loss_value
@@ -562,9 +673,17 @@ def train(
             epoch_micro_batches += 1
 
             if (step + 1) % accumulation == 0:
+                head_before = {
+                    name: parameter.detach().cpu().clone()
+                    for name, parameter in model.lm_head.named_parameters()
+                }
                 run_optimizer_step(
                     model, optimizer, scaler, scheduler, max_grad_norm
                 )
+                head_changed_any = (
+                    head_changed_any or ctc_head_parameters_changed(model, head_before)
+                )
+                diagnostics_last["ctc_head_parameters_changed"] = head_changed_any
                 global_step += 1
                 optimizer_steps_this_epoch += 1
                 if wandb is not None:
@@ -578,9 +697,18 @@ def train(
 
         # Perform an optimizer step for a partial final accumulation block.
         if not stop_training and running_micro_batches > 0:
+            head_before = {
+                name: parameter.detach().cpu().clone()
+                for name, parameter in model.lm_head.named_parameters()
+            }
             run_optimizer_step(
                 model, optimizer, scaler, scheduler, max_grad_norm
             )
+            head_changed_any = (
+                head_changed_any or ctc_head_parameters_changed(model, head_before)
+            )
+            if diagnostics_last is not None:
+                diagnostics_last["ctc_head_parameters_changed"] = head_changed_any
             global_step += 1
             optimizer_steps_this_epoch += 1
             if wandb is not None:
@@ -614,12 +742,19 @@ def train(
             f"dev_loss={dev_result['loss']:.6f} "
             f"dev_mer={dev_result['mer']:.6f}"
         )
+        if diagnostics_last is not None:
+            print(
+                "ctc_diagnostics="
+                + json.dumps(diagnostics_last, ensure_ascii=False)
+            )
         history_row: dict[str, Any] = {
             "epoch": epoch + 1,
             "train_epoch_loss": train_epoch_loss,
             "dev_full_loss": dev_result["loss"],
             "dev_full_mer": dev_result["mer"],
         }
+        if diagnostics_last is not None:
+            history_row["ctc_diagnostics"] = diagnostics_last
         if train_subset_result is not None:
             history_row["train_subset_loss"] = train_subset_result["loss"]
             history_row["train_subset_mer"] = train_subset_result["mer"]
@@ -655,6 +790,16 @@ def train(
             if dev_subset_result is not None:
                 log_row["dev_subset/loss"] = dev_subset_result["loss"]
                 log_row["dev_subset/MER"] = dev_subset_result["mer"]
+            if diagnostics_last is not None:
+                log_row["ctc/blank_prediction_ratio"] = diagnostics_last[
+                    "blank_prediction_ratio_mean"
+                ]
+                log_row["ctc/head_gradient_norm"] = diagnostics_last[
+                    "head_gradient_norm"
+                ]
+                log_row["ctc/total_gradient_norm"] = diagnostics_last[
+                    "total_gradient_norm"
+                ]
             wandb.log(log_row)
 
         if should_replace_best_checkpoint(

@@ -10,13 +10,17 @@ from codeswitch_asr.evaluate import greedy_ctc_decode, greedy_ctc_decode_with_st
 from codeswitch_asr.finetune import (
     apply_duration_limit,
     build_parser,
+    ctc_diagnostics,
+    gradient_diagnostics,
     get_device,
     load_training_state,
     load_yaml_config,
     run_optimizer_step,
     save_checkpoint,
     should_replace_best_checkpoint,
+    train,
     validate_train_sets,
+    validate_ctc_loss_reduction,
 )
 
 
@@ -37,6 +41,30 @@ def test_overfit_config_uses_subset_and_sufficient_epochs():
     )
     assert config["epochs"] == 20
     assert config["dev_subset_samples"] == 200
+    assert config["ctc_loss_reduction"] == "mean"
+    assert config["require_fresh_checkpoint"]
+
+
+def test_tiny_overfit_config_is_fresh_and_small():
+    config = load_yaml_config(
+        Path(__file__).parents[1] / "configs" / "ft_cs_dialogue_tiny_overfit.yaml"
+    )
+    assert config["train_sample_limit"] == 8
+    assert config["epochs"] == 40
+    assert config["ctc_loss_reduction"] == "mean"
+    assert config["require_fresh_checkpoint"]
+    assert validate_ctc_loss_reduction("MEAN") == "mean"
+    with pytest.raises(ValueError, match="ctc_loss_reduction"):
+        validate_ctc_loss_reduction("batch")
+
+
+def test_fresh_overfit_config_rejects_resume():
+    config = load_yaml_config(
+        Path(__file__).parents[1] / "configs" / "ft_cs_dialogue_tiny_overfit.yaml"
+    )
+    config["resume_from_checkpoint"] = "checkpoints/old_blank_checkpoint"
+    with pytest.raises(ValueError, match="fresh XLS-R-300M"):
+        train(config, dataset_root="/tmp/unused", device_selection="cpu")
 
 
 def test_cli_train_limit_and_disable_wandb_flags():
@@ -153,6 +181,39 @@ def test_unknown_tokens_are_reported_not_silently_discarded():
     assert decoded["hypotheses"] == ["[UNK]你"]
     assert decoded["unknown_token_count"] == 1
     assert decoded["unknown_utterance_count"] == 1
+
+
+class _DiagnosticModel:
+    lm_head = torch.nn.Linear(3, 3)
+
+    @staticmethod
+    def _get_feat_extract_output_lengths(input_lengths):
+        return input_lengths
+
+
+def test_ctc_diagnostics_report_blank_ratio_and_lengths():
+    model = _DiagnosticModel()
+    logits = torch.tensor([
+        [[0.0, 10.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]],
+        [[0.0, 10.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+    ])
+    batch = {
+        "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0]]),
+        "labels": torch.tensor([[3, 4, -100], [3, -100, -100]]),
+    }
+    result = ctc_diagnostics(model, logits, batch, blank_id=1)
+    assert result["blank_prediction_counts"] == [2, 1]
+    assert result["nonblank_prediction_counts"] == [1, 1]
+    assert result["ctc_input_lengths"] == [3, 2]
+    assert result["ctc_target_lengths"] == [2, 1]
+
+
+def test_gradient_diagnostics_require_finite_nonzero_head_gradient():
+    model = torch.nn.Linear(2, 3)
+    model(torch.tensor([[1.0, 2.0]])).sum().backward()
+    result = gradient_diagnostics(model)
+    assert result["head_has_finite_gradient"]
+    assert result["head_has_nonzero_gradient"]
 
 
 def test_missing_training_state_is_safe(tmp_path):
