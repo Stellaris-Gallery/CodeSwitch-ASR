@@ -128,4 +128,22 @@ uv run python -m codeswitch_asr.finetune train `
   --disable-wandb
 ```
 
+Run the exact one-utterance CTC convergence diagnostic:
+
+```powershell
+$env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
+uv run python -m codeswitch_asr.finetune train `
+  --config configs/ft_cs_dialogue_single_utterance.yaml `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --max-steps 200 `
+  --device cuda `
+  --disable-wandb
+```
+
+The single-utterance profile initializes XLS-R from the pretrained encoder with
+a fresh CTC head, disables SpecAugment/dropout/layerdrop, uses constant learning
+rate with warmup, saves sparse checkpoints, and does not evaluate full Dev at the
+end. It records CTC loss, MER, greedy decoding, blank top-1 ratio, and mean blank
+probability for `ZH-CN_U0001_S0_103` in `validation_progress.json`.
+
 Do not commit any `.wav`, processed manifest, model weight, or HF cache to the public repository.

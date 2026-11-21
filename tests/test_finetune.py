@@ -5,19 +5,24 @@ from pathlib import Path
 import pytest
 import torch
 
+import codeswitch_asr.finetune as finetune_module
+
 from codeswitch_asr.data import ASRRecord
 from codeswitch_asr.evaluate import greedy_ctc_decode, greedy_ctc_decode_with_stats
 from codeswitch_asr.finetune import (
     apply_duration_limit,
     build_parser,
     ctc_diagnostics,
+    fixed_utterance_diagnostics,
     gradient_diagnostics,
     get_device,
     load_training_state,
     load_yaml_config,
     run_optimizer_step,
     save_checkpoint,
+    select_utterance_by_id,
     should_replace_best_checkpoint,
+    should_save_sparse_checkpoint,
     train,
     validate_train_sets,
     validate_ctc_loss_reduction,
@@ -45,11 +50,25 @@ def test_overfit_config_uses_subset_and_sufficient_epochs():
     assert config["require_fresh_checkpoint"]
 
 
+def test_single_utterance_config_is_exact_and_diagnostic_only():
+    config = load_yaml_config(
+        Path(__file__).parents[1] / "configs" / "ft_cs_dialogue_single_utterance.yaml"
+    )
+    assert config["diagnostic_utterance_id"] == "ZH-CN_U0001_S0_103"
+    assert config["train_sample_limit"] == 1
+    assert config["scheduler"] == "constant_with_warmup"
+    assert config["checkpoint_save_interval_epochs"] == 25
+    assert config["skip_full_dev_evaluation"]
+    assert config["diagnostic_disable_specaugment_dropout"]
+    assert config["require_fresh_checkpoint"]
+
+
 def test_tiny_overfit_config_is_fresh_and_small():
     config = load_yaml_config(
         Path(__file__).parents[1] / "configs" / "ft_cs_dialogue_tiny_overfit.yaml"
     )
-    assert config["train_sample_limit"] == 8
+    assert config["diagnostic_utterance_id"] == "ZH-CN_U0001_S0_103"
+    assert config["train_sample_limit"] == 1
     assert config["epochs"] == 40
     assert config["ctc_loss_reduction"] == "mean"
     assert config["require_fresh_checkpoint"]
@@ -123,6 +142,20 @@ def test_duration_limit_only_filters_training_records(tmp_path):
     assert [row.id for row in excluded] == ["long"]
 
 
+def test_select_exact_retained_utterance(tmp_path):
+    target = ASRRecord(
+        "ZH-CN_U0001_S0_103", tmp_path / "a.wav", "那你呢",
+        "<CN>", "1", "train", 1.0, "那|你|呢",
+    )
+    other = ASRRecord(
+        "other", tmp_path / "b.wav", "你好",
+        "<CN>", "1", "train", 1.0, "你好",
+    )
+    assert select_utterance_by_id([other, target], target.id) == [target]
+    with pytest.raises(ValueError, match="not found"):
+        select_utterance_by_id([other], target.id)
+
+
 def test_device_validation():
     assert get_device("cpu").type == "cpu"
     with pytest.raises(ValueError, match="device"):
@@ -147,6 +180,65 @@ def test_best_checkpoint_uses_lower_loss_for_exact_mer_tie():
         candidate_loss=29474.0,
         best_loss=29081.0,
     )
+
+
+def test_sparse_checkpoint_schedule():
+    assert not should_save_sparse_checkpoint(10, 40, 25)
+    assert should_save_sparse_checkpoint(25, 40, 25)
+    assert should_save_sparse_checkpoint(40, 40, 25)
+
+
+def test_fixed_utterance_tracking(monkeypatch, tmp_path):
+    class FakeDataset:
+        def __init__(self, records, processor):
+            pass
+
+        def __getitem__(self, index):
+            return {"input_values": torch.zeros(3), "labels": [3]}
+
+    class FakeProcessor:
+        tokenizer = _Tokenizer()
+
+    class FakeOutput:
+        loss = torch.tensor(1.25)
+        logits = torch.tensor([[
+            [0.0, 10.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [10.0, 0.0, 0.0],
+        ]])
+
+    class FakeModel:
+        def eval(self):
+            pass
+
+        def train(self):
+            pass
+
+        def __call__(self, **batch):
+            return FakeOutput()
+
+        def _get_feat_extract_output_lengths(self, lengths):
+            return lengths
+
+    monkeypatch.setattr(finetune_module, "CSDialogueCTCDataset", FakeDataset)
+
+    def collator(features):
+        return {
+            "input_values": torch.zeros(1, 3),
+            "attention_mask": torch.ones(1, 3, dtype=torch.long),
+            "labels": torch.tensor([[3, -100, -100]]),
+        }
+
+    record = ASRRecord(
+        "ZH-CN_U0001_S0_103", tmp_path / "a.wav", "那你呢",
+        "<CN>", "1", "train", 1.0, "那|你|呢",
+    )
+    result = fixed_utterance_diagnostics(
+        FakeModel(), FakeProcessor(), record, collator, torch.device("cpu")
+    )
+    assert result["utterance_id"] == "ZH-CN_U0001_S0_103"
+    assert result["blank_top1_ratio"] == pytest.approx(1 / 3)
+    assert 0.0 <= result["mean_blank_probability"] <= 1.0
 
 
 class _Tokenizer:

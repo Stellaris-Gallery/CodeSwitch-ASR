@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader
 from transformers import (
     Wav2Vec2ForCTC,
     get_cosine_schedule_with_warmup,
+    get_constant_schedule,
+    get_constant_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
 
@@ -67,6 +69,18 @@ def validate_ctc_loss_reduction(value: str) -> str:
     if value not in ("mean", "sum"):
         raise ValueError("ctc_loss_reduction must be 'mean' or 'sum'")
     return value
+
+
+def select_utterance_by_id(records: list[Any], utterance_id: str) -> list[Any]:
+    """Select exactly one retained training utterance and reject missing IDs."""
+    matches = [row for row in records if row.id == utterance_id]
+    if not matches:
+        raise ValueError(
+            f"Training utterance ID not found in retained train split: {utterance_id}"
+        )
+    if len(matches) != 1:
+        raise ValueError(f"Duplicate retained training utterance ID: {utterance_id}")
+    return matches
 
 
 def set_seed(seed: int) -> None:
@@ -167,6 +181,16 @@ def should_replace_best_checkpoint(
     if candidate_mer > best_mer:
         return False
     return candidate_loss < best_loss
+
+
+def should_save_sparse_checkpoint(
+    epoch_number: int,
+    scheduled_epochs: int,
+    interval: int,
+) -> bool:
+    if interval <= 0:
+        return True
+    return epoch_number % interval == 0 or scheduled_epochs == epoch_number
 
 
 def evaluate(
@@ -348,6 +372,53 @@ def ctc_head_parameters_changed(model, before: dict[str, torch.Tensor]) -> bool:
     return False
 
 
+def fixed_utterance_diagnostics(
+    model,
+    processor,
+    record,
+    collator,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Measure CTC loss, MER, decoding, and blank probabilities for one fixed utterance."""
+    dataset = CSDialogueCTCDataset([record], processor)
+    batch = collator([dataset[0]])
+    batch = {key: value.to(device) for key, value in batch.items()}
+    model.eval()
+    with torch.no_grad():
+        output = model(**batch)
+        logits = output.logits
+        probabilities = torch.softmax(logits, dim=-1)
+        blank_id = processor.tokenizer.pad_token_id
+        predictions = logits.argmax(dim=-1)
+        input_lengths = batch["attention_mask"].sum(dim=-1)
+        output_lengths = model._get_feat_extract_output_lengths(input_lengths)
+        length = int(output_lengths[0].detach().cpu())
+        frame_predictions = predictions[0, :length]
+        blank_top1_ratio = float(
+            (frame_predictions == blank_id).float().mean().cpu()
+        ) if length else 0.0
+        mean_blank_probability = float(
+            probabilities[0, :length, blank_id].mean().cpu()
+        ) if length else 0.0
+        decoded = greedy_ctc_decode_with_stats(
+            logits, processor, output_lengths=output_lengths
+        )["hypotheses"][0]
+    mer = compute_mer_by_group(
+        [record.text], [decoded], [record.tag]
+    )["ALL"]["mer"]
+    model.train()
+    return {
+        "utterance_id": record.id,
+        "reference": record.text,
+        "decoded": decoded,
+        "ctc_loss": float(output.loss.detach().cpu()),
+        "mer": mer,
+        "blank_top1_ratio": blank_top1_ratio,
+        "mean_blank_probability": mean_blank_probability,
+        "unknown_token_count": decoded.count("[UNK]"),
+    }
+
+
 def train(
     config: dict[str, Any],
     *,
@@ -388,6 +459,13 @@ def train(
 
     train_records = load_train_manifest(root, check_files=True)
     dev_records = load_official_eval_split(root, "dev")
+    diagnostic_utterance_id = config.get("diagnostic_utterance_id")
+    fixed_diagnostic_record = None
+    if diagnostic_utterance_id:
+        train_records = select_utterance_by_id(
+            train_records, str(diagnostic_utterance_id)
+        )
+        fixed_diagnostic_record = train_records[0]
 
     max_duration = config.get("max_train_duration_seconds")
     if max_duration is not None:
@@ -523,11 +601,23 @@ def train(
         )
 
     resume_path = config.get("resume_from_checkpoint")
+    diagnostic_model_kwargs: dict[str, Any] = {}
+    if config.get("diagnostic_disable_specaugment_dropout", False):
+        diagnostic_model_kwargs.update({
+            "mask_time_prob": 0.0,
+            "mask_feature_prob": 0.0,
+            "attention_dropout": 0.0,
+            "feat_proj_dropout": 0.0,
+            "hidden_dropout": 0.0,
+            "final_dropout": 0.0,
+            "layerdrop": 0.0,
+        })
     if resume_path:
         model = Wav2Vec2ForCTC.from_pretrained(
             resume_path,
             ctc_zero_infinity=True,
             ctc_loss_reduction=ctc_loss_reduction,
+            **diagnostic_model_kwargs,
         ).to(device)
     else:
         model = Wav2Vec2ForCTC.from_pretrained(
@@ -537,6 +627,7 @@ def train(
             ignore_mismatched_sizes=True,
             ctc_zero_infinity=True,
             ctc_loss_reduction=ctc_loss_reduction,
+            **diagnostic_model_kwargs,
         ).to(device)
 
     if bool(config.get("freeze_feature_encoder", True)):
@@ -564,6 +655,12 @@ def train(
     if scheduler_name == "cosine":
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+        )
+    elif scheduler_name == "constant":
+        scheduler = get_constant_schedule(optimizer)
+    elif scheduler_name == "constant_with_warmup":
+        scheduler = get_constant_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup_steps
         )
     else:
         scheduler = get_linear_schedule_with_warmup(
@@ -624,6 +721,7 @@ def train(
         unfreeze_epoch = int(unfreeze_epoch)
 
     overfit_history: list[dict[str, Any]] = []
+    checkpoint_save_interval = int(config.get("checkpoint_save_interval_epochs", 0))
     stop_training = False
     for epoch in range(start_epoch, scheduled_epochs):
         if stop_training:
@@ -736,6 +834,11 @@ def train(
                 model, train_subset_dataloader, processor, device,
                 mixed_precision=mixed_precision,
             )
+        fixed_sample_result = None
+        if fixed_diagnostic_record is not None:
+            fixed_sample_result = fixed_utterance_diagnostics(
+                model, processor, fixed_diagnostic_record, collator, device
+            )
         train_epoch_loss = epoch_loss_sum / max(epoch_micro_batches, 1)
         print(
             f"epoch={epoch + 1} train_loss={train_epoch_loss:.6f} "
@@ -755,6 +858,12 @@ def train(
         }
         if diagnostics_last is not None:
             history_row["ctc_diagnostics"] = diagnostics_last
+        if fixed_sample_result is not None:
+            history_row["fixed_utterance"] = fixed_sample_result
+            print(
+                "fixed_utterance="
+                + json.dumps(fixed_sample_result, ensure_ascii=False)
+            )
         if train_subset_result is not None:
             history_row["train_subset_loss"] = train_subset_result["loss"]
             history_row["train_subset_mer"] = train_subset_result["mer"]
@@ -800,6 +909,13 @@ def train(
                 log_row["ctc/total_gradient_norm"] = diagnostics_last[
                     "total_gradient_norm"
                 ]
+            if fixed_sample_result is not None:
+                log_row["fixed/ctc_loss"] = fixed_sample_result["ctc_loss"]
+                log_row["fixed/MER"] = fixed_sample_result["mer"]
+                log_row["fixed/blank_top1_ratio"] = fixed_sample_result["blank_top1_ratio"]
+                log_row["fixed/mean_blank_probability"] = fixed_sample_result[
+                    "mean_blank_probability"
+                ]
             wandb.log(log_row)
 
         if should_replace_best_checkpoint(
@@ -817,14 +933,19 @@ def train(
                     "selection_scope": "dev_subset" if dev_subset_result is not None else "dev_full",
                     **dev_result,
                 }, target, ensure_ascii=False, indent=2)
-        save_checkpoint(
-            output_dir, f"epoch-{epoch + 1}", model, processor,
-            optimizer, scheduler, epoch, global_step, best_mer, best_loss,
-        )
+        epoch_number = epoch + 1
+        if should_save_sparse_checkpoint(
+            epoch_number, scheduled_epochs, checkpoint_save_interval
+        ):
+            save_checkpoint(
+                output_dir, f"epoch-{epoch_number}", model, processor,
+                optimizer, scheduler, epoch, global_step, best_mer, best_loss,
+            )
 
     final_full_dev_result = None
     best_path = output_dir / "best"
-    if best_path.is_dir():
+    skip_full_dev = bool(config.get("skip_full_dev_evaluation", False))
+    if best_path.is_dir() and not skip_full_dev:
         best_model = Wav2Vec2ForCTC.from_pretrained(
             best_path, ctc_zero_infinity=True
         ).to(device)

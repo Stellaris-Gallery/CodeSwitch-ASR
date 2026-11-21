@@ -1,0 +1,36 @@
+# Exact one-utterance CTC convergence diagnostic.
+run_name: ft_cs_dialogue_single_utterance
+data_config: configs/data.yaml
+base_model: facebook/wav2vec2-xls-r-300m
+head: ctc
+train_sets: [public_train]
+eval_sets: [public_dev]
+final_eval_sets: []
+optimizer:
+  name: adamw
+  lr: 1.0e-4
+batch_size: 1
+epochs: 40
+diagnostic_utterance_id: ZH-CN_U0001_S0_103
+train_sample_limit: 1
+seed: 0
+output_dir: checkpoints/ft_cs_dialogue_single_utterance
+gradient_accumulation_steps: 1
+warmup_ratio: 0.1
+warmup_steps: 10
+scheduler: constant_with_warmup
+mixed_precision: bf16
+ctc_loss_reduction: mean
+require_fresh_checkpoint: true
+freeze_feature_encoder: true
+feature_encoder_unfreeze_epoch: null
+max_grad_norm: 1.0
+dataloader_num_workers: 0
+dev_subset_samples: 100
+checkpoint_save_interval_epochs: 25
+skip_full_dev_evaluation: true
+diagnostic_disable_specaugment_dropout: true
+wandb:
+  project: codeswitch-asr
+  enabled: true
+  mode: online
