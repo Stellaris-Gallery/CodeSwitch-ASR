@@ -115,6 +115,7 @@ def save_checkpoint(
     epoch: int = 0,
     global_step: int = 0,
     best_mer: float = float("inf"),
+    best_loss: float = float("inf"),
 ) -> Path:
     """Save a loadable Hugging Face model plus compact training state."""
     destination = _safe_output_dir(Path(output_dir) / name)
@@ -126,6 +127,7 @@ def save_checkpoint(
             "epoch": epoch,
             "global_step": global_step,
             "best_mer": best_mer,
+            "best_loss": best_loss,
             "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "rng": {
@@ -146,9 +148,18 @@ def load_training_state(path: str | Path) -> dict[str, Any] | None:
     return torch.load(state_path, map_location="cpu", weights_only=False)
 
 
-def should_replace_best_checkpoint(candidate_mer: float, best_mer: float) -> bool:
-    """Best checkpoint selection uses dev MER only and never test MER."""
-    return candidate_mer < best_mer
+def should_replace_best_checkpoint(
+    candidate_mer: float,
+    best_mer: float,
+    candidate_loss: float = float("inf"),
+    best_loss: float = float("inf"),
+) -> bool:
+    """Select by lower dev MER, then lower dev loss on exact MER ties."""
+    if candidate_mer < best_mer:
+        return True
+    if candidate_mer > best_mer:
+        return False
+    return candidate_loss < best_loss
 
 
 def evaluate(
@@ -297,6 +308,11 @@ def train(
     if max_steps is not None and max_steps <= 0:
         raise ValueError("max_steps must be positive")
     if dev_subset_samples is not None:
+        if dev_subset_samples <= 0:
+            raise ValueError("dev_subset_samples must be positive")
+        dev_subset_samples = min(dev_subset_samples, len(dev_records))
+    elif config.get("dev_subset_samples") is not None:
+        dev_subset_samples = int(config["dev_subset_samples"])
         if dev_subset_samples <= 0:
             raise ValueError("dev_subset_samples must be positive")
         dev_subset_samples = min(dev_subset_samples, len(dev_records))
@@ -482,12 +498,14 @@ def train(
     start_epoch = 0
     global_step = 0
     best_mer = float("inf")
+    best_loss = float("inf")
     if resume_path:
         state = load_training_state(resume_path)
         if state is not None:
             start_epoch = int(state["epoch"]) + 1
             global_step = int(state["global_step"])
             best_mer = float(state["best_mer"])
+            best_loss = float(state.get("best_loss", float("inf")))
             if state.get("optimizer") is not None:
                 optimizer.load_state_dict(state["optimizer"])
             if state.get("scheduler") is not None:
@@ -572,20 +590,22 @@ def train(
                     "train/global_step": global_step,
                 })
 
-        dev_result = evaluate(
-            model, dev_dataloader, processor, device,
-            mixed_precision=mixed_precision,
-        )
-        train_subset_result = None
-        if train_subset_dataloader is not None:
-            train_subset_result = evaluate(
-                model, train_subset_dataloader, processor, device,
-                mixed_precision=mixed_precision,
-            )
         dev_subset_result = None
         if dev_subset_dataloader is not None:
             dev_subset_result = evaluate(
                 model, dev_subset_dataloader, processor, device,
+                mixed_precision=mixed_precision,
+            )
+            dev_result = dev_subset_result
+        else:
+            dev_result = evaluate(
+                model, dev_dataloader, processor, device,
+                mixed_precision=mixed_precision,
+            )
+        train_subset_result = None
+        if train_subset_dataloader is not None:
+            train_subset_result = evaluate(
+                model, train_subset_dataloader, processor, device,
                 mixed_precision=mixed_precision,
             )
         train_epoch_loss = epoch_loss_sum / max(epoch_micro_batches, 1)
@@ -637,17 +657,24 @@ def train(
                 log_row["dev_subset/MER"] = dev_subset_result["mer"]
             wandb.log(log_row)
 
-        if should_replace_best_checkpoint(dev_result["mer"], best_mer):
+        if should_replace_best_checkpoint(
+            dev_result["mer"], best_mer, dev_result["loss"], best_loss
+        ):
             best_mer = dev_result["mer"]
+            best_loss = dev_result["loss"]
             save_checkpoint(
                 output_dir, "best", model, processor,
-                optimizer, scheduler, epoch, global_step, best_mer,
+                optimizer, scheduler, epoch, global_step, best_mer, best_loss,
             )
             with (output_dir / "best_metrics.json").open("w", encoding="utf-8") as target:
-                json.dump({"epoch": epoch + 1, **dev_result}, target, ensure_ascii=False, indent=2)
+                json.dump({
+                    "epoch": epoch + 1,
+                    "selection_scope": "dev_subset" if dev_subset_result is not None else "dev_full",
+                    **dev_result,
+                }, target, ensure_ascii=False, indent=2)
         save_checkpoint(
             output_dir, f"epoch-{epoch + 1}", model, processor,
-            optimizer, scheduler, epoch, global_step, best_mer,
+            optimizer, scheduler, epoch, global_step, best_mer, best_loss,
         )
 
     final_full_dev_result = None

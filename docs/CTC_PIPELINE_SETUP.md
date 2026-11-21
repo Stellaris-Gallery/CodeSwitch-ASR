@@ -47,19 +47,18 @@ Run a 1-GPU experiment with:
 
 ```powershell
 $env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
-uv run python -m codeswitch_asr.finetune --config configs/ft_cs_dialogue.yaml
+uv run python -m codeswitch_asr.finetune train --config configs/ft_cs_dialogue.yaml
 ```
 
-For a reproducible 50-utterance / 10-optimizer-step CPU or workstation check:
+For a reproducible 50-utterance workstation overfit check:
 
 ```powershell
 $env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
 uv run python -m codeswitch_asr.finetune train `
-  --config configs/ft_cs_dialogue.yaml `
+  --config configs/ft_cs_dialogue_overfit.yaml `
   --dataset-root "$env:CS_DIALOGUE_ROOT" `
   --max-train-samples 50 `
-  --max-steps 10 `
-  --dev-subset-samples 200 `
+  --max-steps 200 `
   --device cuda `
   --disable-wandb
 ```

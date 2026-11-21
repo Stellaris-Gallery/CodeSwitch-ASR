@@ -31,6 +31,14 @@ def test_training_config_loads_and_validates():
     assert config["wandb"]["project"] == "codeswitch-asr"
 
 
+def test_overfit_config_uses_subset_and_sufficient_epochs():
+    config = load_yaml_config(
+        Path(__file__).parents[1] / "configs" / "ft_cs_dialogue_overfit.yaml"
+    )
+    assert config["epochs"] == 20
+    assert config["dev_subset_samples"] == 200
+
+
 def test_cli_train_limit_and_disable_wandb_flags():
     parser = build_parser()
     args = parser.parse_args([
@@ -96,6 +104,21 @@ def test_device_validation():
 def test_best_checkpoint_selection_uses_lower_mer():
     assert should_replace_best_checkpoint(0.25, 0.30)
     assert not should_replace_best_checkpoint(0.35, 0.30)
+
+
+def test_best_checkpoint_uses_lower_loss_for_exact_mer_tie():
+    assert should_replace_best_checkpoint(
+        candidate_mer=1.0,
+        best_mer=1.0,
+        candidate_loss=29081.0,
+        best_loss=29474.0,
+    )
+    assert not should_replace_best_checkpoint(
+        candidate_mer=1.0,
+        best_mer=1.0,
+        candidate_loss=29474.0,
+        best_loss=29081.0,
+    )
 
 
 class _Tokenizer:
