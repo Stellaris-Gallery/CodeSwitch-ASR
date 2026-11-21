@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--dataset-root", type=Path, default=os.environ.get("CS_DIALOGUE_ROOT"))
     parser.add_argument("--model", default="facebook/wav2vec2-xls-r-300m")
     parser.add_argument("--gpu-smoke", action="store_true")
+    parser.add_argument("--ctc-loss-reduction", choices=("mean", "sum"), default="mean")
     args = parser.parse_args()
     if args.dataset_root is None:
         parser.error("Supply --dataset-root or set CS_DIALOGUE_ROOT")
@@ -88,6 +89,7 @@ def main():
         pad_token_id=processor.tokenizer.pad_token_id,
         ignore_mismatched_sizes=True,
         ctc_zero_infinity=True,
+        ctc_loss_reduction=args.ctc_loss_reduction,
     ).to("cuda:0")
     model.train()
     # The experiment's eventual freeze/unfreeze policy remains to be decided.

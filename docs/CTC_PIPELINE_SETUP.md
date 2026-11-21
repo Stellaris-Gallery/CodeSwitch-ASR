@@ -37,6 +37,95 @@ uv run python scripts/smoke_ctc_data.py --dataset-root "$env:CS_DIALOGUE_ROOT" -
 
 ## Next milestone
 
-Implement `finetune.py`, validation MER, W&B logging, checkpoint saving, and a training config for 1-GPU runs, with explicit epoch/batch and mixed-precision settings. Only after a stable single-GPU run should distributed GPU training be considered.
+`finetune.py` now provides the 1-GPU CTC training entry point. It loads the
+train-only vocabulary, fine-tunes the XLS-R CTC head, evaluates the official
+dev split for model selection, logs metrics/config/checkpoints to W&B, and runs
+the official public test split only after training. Private `ours_test`
+checkpoints remain outside this repository.
+
+Run a 1-GPU experiment with:
+
+```powershell
+$env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
+uv run python -m codeswitch_asr.finetune train --config configs/ft_cs_dialogue.yaml
+```
+
+For a reproducible 50-utterance workstation overfit check:
+
+```powershell
+$env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
+uv run python -m codeswitch_asr.finetune train `
+  --config configs/ft_cs_dialogue_overfit.yaml `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --max-train-samples 50 `
+  --max-steps 200 `
+  --device cuda `
+  --disable-wandb
+```
+
+Dry-run (no model download or training):
+
+```powershell
+uv run python -m codeswitch_asr.finetune train `
+  --config configs/ft_cs_dialogue.yaml `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --max-train-samples 50 `
+  --max-steps 10 `
+  --device cpu `
+  --dry-run `
+  --disable-wandb
+```
+
+Public test evaluation is deliberately separate and never affects model selection:
+
+```powershell
+uv run python -m codeswitch_asr.finetune evaluate `
+  --checkpoint "checkpoints\ft_cs_dialogue\best" `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --split public_test `
+  --device cuda
+```
+
+The 50-sample run records fixed-subset train loss/MER and the configured dev
+subset loss/MER in `validation_progress.json`. Full official dev is still
+evaluated for intermediate model selection and re-evaluated from the best
+checkpoint after training.
+
+Use `--disable-wandb` for local-only runs or set `wandb.enabled: false` in the
+experiment YAML. Resume a previous run with
+`--resume-from-checkpoint checkpoints/ft_cs_dialogue/best`.
+
+## Experiment status
+
+- `ft_cs_dialogue.yaml`: implemented clean public-train pipeline.
+- `ft_cs_dialogue_noise.yaml`: configuration present; room-tone/reverb augmentation is not implemented yet.
+- `ft_cs_dialogue_noise_ours.yaml`: configuration present; private-recording collection and in-domain training data are not implemented yet.
+- No full GPU training or 50-sample overfit validation is claimed by this repository snapshot.
+
+## CTC numerical stability diagnostics
+
+`ctc_loss_reduction` is configurable and defaults to `sum` for existing
+configs. The small overfit profiles use `mean`:
+
+- `sum` accumulates the per-batch CTC loss scale across every target frame.
+- `mean` normalizes CTC loss by target lengths and can reduce batch-size/duration scaling.
+
+This difference is not presented as a proven cause of blank collapse.
+
+Training diagnostics are written to `validation_progress.json` and stdout:
+CTC input/target lengths, blank and nonblank frame counts, total/head gradient
+norms, finite/nonzero CTC-head gradients, and whether head parameters changed.
+
+Run the fresh 8-sample diagnosis (do not resume collapsed checkpoints):
+
+```powershell
+$env:CS_DIALOGUE_ROOT = "D:\Deeplearning Final Project\Datasets\CS-Dialogue"
+uv run python -m codeswitch_asr.finetune train `
+  --config configs/ft_cs_dialogue_tiny_overfit.yaml `
+  --dataset-root "$env:CS_DIALOGUE_ROOT" `
+  --max-steps 200 `
+  --device cuda `
+  --disable-wandb
+```
 
 Do not commit any `.wav`, processed manifest, model weight, or HF cache to the public repository.

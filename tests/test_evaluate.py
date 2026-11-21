@@ -1,8 +1,33 @@
 """Tests for MER. Each expected number was worked out by hand (see comments)."""
 
 import pytest
+import torch
 
-from codeswitch_asr.evaluate import compute_mer, compute_mer_by_group
+from codeswitch_asr.evaluate import (
+    compute_mer,
+    compute_mer_by_group,
+    greedy_ctc_decode,
+)
+
+
+class _Tokenizer:
+    pad_token_id = 0
+    word_delimiter_token = "|"
+
+    def convert_tokens_to_ids(self, token):
+        return 1 if token == "|" else -1
+
+    def convert_ids_to_tokens(self, token_id):
+        return {2: "你", 3: "好", 4: "IBM", 1: "|"}.get(token_id, "[UNK]")
+
+
+class _Processor:
+    tokenizer = _Tokenizer()
+
+
+def test_greedy_ctc_decode_merges_repeats_and_drops_blank():
+    predictions = torch.tensor([[2, 2, 0, 3, 1, 4, 4]])
+    assert greedy_ctc_decode(predictions, _Processor()) == ["你好 IBM"]
 
 
 def test_perfect_after_normalization():

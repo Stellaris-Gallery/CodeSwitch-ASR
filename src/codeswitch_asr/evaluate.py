@@ -13,10 +13,107 @@ repeats, drop blanks.
 """
 
 from collections import defaultdict
+from typing import Any
 
 import jiwer
+import torch
 
 from codeswitch_asr.normalize import normalize
+
+
+def greedy_ctc_decode(
+    predictions: torch.Tensor,
+    processor: Any,
+    *,
+    blank_id: int | None = None,
+    output_lengths: torch.Tensor | list[int] | None = None,
+) -> list[str]:
+    """Collapse frame-level CTC predictions into text hypotheses.
+
+    Accepts either logits ``[batch, time, vocab]`` or token IDs
+    ``[batch, time]``.  Repeated IDs are collapsed and the CTC blank is removed.
+    Word-delimiter IDs (``|``) are converted to spaces for MER normalization.
+    """
+    if not isinstance(predictions, torch.Tensor):
+        raise TypeError("predictions must be a torch.Tensor")
+
+    if predictions.ndim == 3:
+        token_ids = predictions.argmax(dim=-1)
+    elif predictions.ndim == 2:
+        token_ids = predictions
+    else:
+        raise ValueError("predictions must have shape [batch, time] or [batch, time, vocab]")
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if blank_id is None:
+        blank_id = getattr(tokenizer, "pad_token_id", None)
+    if blank_id is None:
+        blank_id = getattr(tokenizer, "blank_id", 0)
+
+    delimiter_id = getattr(tokenizer, "convert_tokens_to_ids", lambda _token: -1)(
+        getattr(tokenizer, "word_delimiter_token", "|")
+    )
+
+    hypotheses: list[str] = []
+    if output_lengths is None:
+        lengths = [row.shape[0] for row in token_ids]
+    elif isinstance(output_lengths, torch.Tensor):
+        lengths = output_lengths.detach().cpu().tolist()
+    else:
+        lengths = list(output_lengths)
+
+    for row_index, row in enumerate(token_ids.detach().cpu().tolist()):
+        length = min(int(lengths[row_index]), len(row))
+        row = row[:length]
+        previous = None
+        tokens: list[str] = []
+        for token_id in row:
+            if token_id == previous:
+                continue
+            previous = token_id
+            if token_id == blank_id:
+                continue
+            if token_id == delimiter_id:
+                tokens.append("|")
+                continue
+            converter = getattr(tokenizer, "convert_ids_to_tokens", None)
+            if converter is not None:
+                token = converter(token_id)
+            else:
+                inverse = getattr(tokenizer, "get_vocab", lambda: {})()
+                token = next(
+                    (text for text, index in inverse.items() if index == token_id),
+                    "[UNK]",
+                )
+            if token not in (None, "", "<blank>", "<s>", "</s>"):
+                tokens.append(str(token))
+
+        text = "".join(tokens).replace("|", " ")
+        hypotheses.append(" ".join(text.split()))
+    return hypotheses
+
+
+def greedy_ctc_decode_with_stats(
+    predictions: torch.Tensor,
+    processor: Any,
+    *,
+    blank_id: int | None = None,
+    output_lengths: torch.Tensor | list[int] | None = None,
+) -> dict[str, Any]:
+    """Decode CTC and report [UNK] emissions without changing MER normalization."""
+    hypotheses = greedy_ctc_decode(
+        predictions,
+        processor,
+        blank_id=blank_id,
+        output_lengths=output_lengths,
+    )
+    unknown_count = sum(hypothesis.count("[UNK]") for hypothesis in hypotheses)
+    unknown_utterances = sum("[UNK]" in hypothesis for hypothesis in hypotheses)
+    return {
+        "hypotheses": hypotheses,
+        "unknown_token_count": unknown_count,
+        "unknown_utterance_count": unknown_utterances,
+    }
 
 
 def compute_mer(refs: list[str], hyps: list[str]) -> dict:
